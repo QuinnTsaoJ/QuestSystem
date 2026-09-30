@@ -439,67 +439,102 @@ QuestComp->LoadFromData(QuestData);                   // 读档
 
 ### 对接 SaveSystem 插件(自动存读)
 
-QuestSystem 不依赖 SaveSystem 插件,但提供了 `SaveToData()`/`LoadFromData()` 供游戏层桥接。在 PlayerController 上实现 `ISaveSystemClient` 即可让 SaveSystem 自动存读任务数据:
+QuestSystem 不依赖 SaveSystem 插件，但提供了 `SaveToData()`/`LoadFromData()` 供游戏层桥接。在 PlayerController 上实现 `ISaveSystemClient` 接口（3 个方法 + 注册/反注册），SaveSystem 存读档时会自动调 `GatherSaveData`/`ApplySaveData` 收集/恢复任务数据。
+
+#### C++ 实现
 
 ```cpp
 // MyPlayerController.h
-#include "Interfaces/ISaveSystemClient.h"
-#include "SaveSystemSaveGame.h"
+#include "GameFramework/PlayerController.h"
+#include "Interfaces/QuestInterface.h"          // QuestSystem 的接口
+#include "ISaveSystemClient.h"                   // SaveSystem 的接口
+#include "SaveSystemSaveGame.h"                  // SaveSystem 数据载体基类
+#include "QuestSaveData.h"                        // QuestSystem 存档结构
+#include "MyPlayerController.generated.h"
 
-// 1. 定义任务数据载体(继承 USaveSystemSaveGameData)
+// 1. 定义任务数据载体(继承 USaveSystemSaveGameData,放强类型字段)
 UCLASS()
 class UQuestSaveCarrier : public USaveSystemSaveGameData
 {
     GENERATED_BODY()
 public:
-    UPROPERTY(SaveGame) FQuestSaveData QuestData;
+    UPROPERTY(SaveGame, BlueprintReadWrite, Category="Quest")
+    FQuestSaveData QuestData;
 };
 
-// 2. PlayerController 实现 ISaveSystemClient
+// 2. PlayerController 同时实现 IQuestInterface 和 ISaveSystemClient
 UCLASS()
 class AMyPlayerController : public APlayerController, public IQuestInterface, public ISaveSystemClient
 {
     GENERATED_BODY()
-    // ... IQuestInterface 实现(见第一步)...
 
-    // === ISaveSystemClient ===
+    // ... IQuestInterface 的 5 个方法(见第一步)...
+
+    // === ISaveSystemClient:重写 _Implementation ===
+    virtual FName GetClientName_Implementation() const override
+    { return TEXT("Quest"); }
+
     virtual USaveSystemSaveGameData* GatherSaveData_Implementation() override
     {
         UQuestSaveCarrier* Carrier = NewObject<UQuestSaveCarrier>(this);
-        Carrier->QuestData = QuestComponent->SaveToData();
+        Carrier->QuestData = QuestComponent->SaveToData();  // 复用 QuestSystem 已有接口
         return Carrier;
     }
 
     virtual void ApplySaveData_Implementation(USaveSystemSaveGameData* Data) override
     {
-        if (UQuestSaveCarrier* Carrier = Cast<UQuestSaveCarrier>(Data))
+        if (UQuestSaveCarrier* Carrier = Cast<UQuestSaveCarrier>(Data))  // 判空 + Cast
         {
             QuestComponent->LoadFromData(Carrier->QuestData);
         }
     }
 
-    virtual FName GetClientName_Implementation() const override
+protected:
+    virtual void BeginPlay() override
     {
-        return TEXT("Quest");
+        Super::BeginPlay();
+        USaveSystemBPLibrary::RegisterSaveClient(this);  // 必须先注册
+        // 若需启动加载:在注册后调 LoadGame
+    }
+
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override
+    {
+        USaveSystemBPLibrary::UnregisterSaveClient(this);  // 必须反注册
+        Super::EndPlay(EndPlayReason);
     }
 };
-
-// 3. BeginPlay 注册到 SaveSystem
-void AMyPlayerController::BeginPlay()
-{
-    Super::BeginPlay();
-    USaveSystemBPLibrary::RegisterSaveClient(this);
-}
-
-// 4. EndPlay 注销
-void AMyPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-    USaveSystemBPLibrary::UnregisterSaveClient(this);
-    Super::EndPlay(EndPlayReason);
-}
 ```
 
-之后 SaveSystem 的 `SaveGame`/`LoadGame` 会自动调 `GatherSaveData`/`ApplySaveData` 存读任务数据,游戏层无需手动调 `SaveToData`/`LoadFromData`。
+> **注意**：`RegisterSaveClient` 必须在 `LoadGame` 之前调用——SaveSystem 遍历已注册客户端注入数据，未注册的客户端收不到 `ApplySaveData`。
+
+#### Blueprint 实现
+
+1. PlayerController 蓝图 → Class Settings → Interfaces → Add `SaveSystemClient`
+2. 创建 `UQuestSaveCarrier` 的蓝图子类（父类选 `SaveSystemSaveGameData`），加一个 `Quest Save Data` 变量
+3. Override 三个事件：
+
+```
+事件:GetClientName (Override) → Return "Quest"
+
+事件:GatherSaveData (Override)
+  → Construct Object (QuestSaveCarrier) → Set QuestData = QuestComponent.SaveToData → Return
+
+事件:ApplySaveData (Override)
+  Data → Cast To QuestSaveCarrier → Get QuestData → QuestComponent.LoadFromData
+
+Event BeginPlay → Register Save Client(self)
+Event EndPlay   → Unregister Save Client(self)
+```
+
+#### 对接检查清单
+
+- [ ] PlayerController 实现了 `ISaveSystemClient`（3 个方法）
+- [ ] `BeginPlay` 调了 `RegisterSaveClient`，`EndPlay` 调了 `UnregisterSaveClient`
+- [ ] `LoadGame` 在 `RegisterSaveClient` **之后**调用
+- [ ] 数据载体继承 `USaveSystemSaveGameData`，字段标了 `SaveGame`
+- [ ] `ApplySaveData` 里对 `Data` 做了 `Cast` + 判空
+
+对接完成后，SaveSystem 的 `SaveGame`/`LoadGame` 会自动存读任务数据，游戏层无需手动调 `SaveToData`/`LoadFromData`。
 
 ---
 
